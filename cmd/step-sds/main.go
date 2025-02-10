@@ -3,25 +3,25 @@ package main
 import (
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
-	"github.com/smallstep/cli/command"
-	"github.com/smallstep/cli/command/version"
-	"github.com/smallstep/cli/config"
-	"github.com/smallstep/cli/usage"
 	"github.com/smallstep/step-sds/sds"
 	"github.com/urfave/cli"
+	"go.step.sm/cli-utils/command"
+	"go.step.sm/cli-utils/command/version"
+	"go.step.sm/cli-utils/step"
+	"go.step.sm/cli-utils/usage"
 
 	// Enabled commands
 	_ "github.com/smallstep/step-sds/commands"
 
-	// Profiling and debugging
+	//nolint:gosec // Profiling and debugging
 	_ "net/http/pprof"
 )
 
@@ -78,28 +78,32 @@ This documentation is available online at https://github.com/smallstep/step-sds
 `
 
 func init() {
-	config.Set("Smallstep SDS", Version, BuildTime)
-	sds.Identifier = config.Version()
-	rand.Seed(time.Now().UnixNano())
+	step.Set("Smallstep SDS", Version, BuildTime)
+	sds.Identifier = step.Version()
 }
 
 func panicHandler() {
 	if r := recover(); r != nil {
 		if os.Getenv("STEPDEBUG") == "1" {
-			fmt.Fprintf(os.Stderr, "%s\n", config.Version())
-			fmt.Fprintf(os.Stderr, "Release Date: %s\n\n", config.ReleaseDate())
+			fmt.Fprintf(os.Stderr, "%s\n", step.Version())
+			fmt.Fprintf(os.Stderr, "Release Date: %s\n\n", step.ReleaseDate())
 			panic(r)
-		} else {
-			fmt.Fprintln(os.Stderr, "Something unexpected happened.")
-			fmt.Fprintln(os.Stderr, "If you want to help us debug the problem, please run:")
-			fmt.Fprintf(os.Stderr, "STEPDEBUG=1 %s\n", strings.Join(os.Args, " "))
-			fmt.Fprintln(os.Stderr, "and send the output to info@smallstep.com")
-			os.Exit(2)
 		}
+		fmt.Fprintln(os.Stderr, "Something unexpected happened.")
+		fmt.Fprintln(os.Stderr, "If you want to help us debug the problem, please run:")
+		fmt.Fprintf(os.Stderr, "STEPDEBUG=1 %s\n", strings.Join(os.Args, " "))
+		fmt.Fprintln(os.Stderr, "and send the output to info@smallstep.com")
+		os.Exit(2)
 	}
 }
 
 func main() {
+	// Initialize step environment.
+	if err := step.Init(); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
 	defer panicHandler()
 	// Override global framework components
 	cli.VersionPrinter = func(c *cli.Context) {
@@ -117,7 +121,7 @@ func main() {
 	app.Name = "step-sds"
 	app.HelpName = "step-sds"
 	app.Usage = "secret discovery service"
-	app.Version = config.Version()
+	app.Version = step.Version()
 	app.Commands = command.Retrieve()
 	app.Flags = append(app.Flags, cli.HelpFlag)
 	app.EnableBashCompletion = true
@@ -133,7 +137,11 @@ func main() {
 	debugProfAddr := os.Getenv("STEP_PROF_ADDR")
 	if debugProfAddr != "" {
 		go func() {
-			log.Println(http.ListenAndServe(debugProfAddr, nil))
+			server := &http.Server{
+				Addr:              debugProfAddr,
+				ReadHeaderTimeout: 15 * time.Second,
+			}
+			log.Println(server.ListenAndServe())
 		}()
 	}
 
@@ -143,7 +151,7 @@ func main() {
 		} else {
 			fmt.Fprintln(os.Stderr, err)
 		}
-		os.Exit(1)
+		runtime.Goexit()
 	}
 }
 
@@ -157,10 +165,10 @@ func flagValue(f cli.Flag) reflect.Value {
 
 func stringifyFlag(f cli.Flag) string {
 	fv := flagValue(f)
-	usage := fv.FieldByName("Usage").String()
-	placeholder := placeholderString.FindString(usage)
+	usg := fv.FieldByName("Usage").String()
+	placeholder := placeholderString.FindString(usg)
 	if placeholder == "" {
 		placeholder = "<value>"
 	}
-	return cli.FlagNamePrefixer(fv.FieldByName("Name").String(), placeholder) + "\t" + usage
+	return cli.FlagNamePrefixer(fv.FieldByName("Name").String(), placeholder) + "\t" + usg
 }
