@@ -1,24 +1,24 @@
 package commands
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"io/ioutil"
 	"net"
+	"os"
 	"time"
+	"unicode"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/ca"
-	"github.com/smallstep/cli/command"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/errs"
-	"github.com/smallstep/cli/ui"
-	"github.com/smallstep/cli/utils"
 	"github.com/smallstep/step-sds/logging"
 	"github.com/smallstep/step-sds/sds"
 	"github.com/urfave/cli"
+	"go.step.sm/cli-utils/command"
+	"go.step.sm/cli-utils/errs"
+	"go.step.sm/cli-utils/ui"
+	"go.step.sm/crypto/pemutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -30,13 +30,13 @@ func init() {
 		Usage:     "run the SDS server",
 		UsageText: "**step-sds run** <config> [--password-file=<file>] [--provisioner-password-file=<file>]",
 		Description: `**step-sds run** starts a secret discovery service (SDS) using the given configuration.
-	
+
 ## POSITIONAL ARGUMENTS
-	
+
 <config>
 : File that configures the operation of the Step SDS; this file is generated
 when you initialize the Step SDS using **step-sds init**
-	
+
 ## EXIT CODES
 
 This command will run indefinitely on success and return \>0 if any error occurs.
@@ -110,7 +110,7 @@ func runAction(ctx *cli.Context) error {
 		c.Provisioner.Password = string(password)
 	}
 	if provPasswordFile != "" {
-		b, err := utils.ReadPasswordFromFile(provPasswordFile)
+		b, err := readPasswordFromFile(provPasswordFile)
 		if err != nil {
 			return err
 		}
@@ -124,13 +124,13 @@ func runAction(ctx *cli.Context) error {
 
 	// Start gRPC server
 	opts := []grpc.ServerOption{
-		grpc_middleware.WithUnaryServerChain(logging.UnaryServerInterceptor(logger)),
-		grpc_middleware.WithStreamServerChain(logging.StreamServerInterceptor(logger)),
+		grpc.ChainUnaryInterceptor(logging.UnaryServerInterceptor(logger)),
+		grpc.ChainStreamInterceptor(logging.StreamServerInterceptor(logger)),
 	}
 
 	if c.IsTCP() {
 		// Parse certificate
-		crtPEM, err := utils.ReadFile(c.Certificate)
+		crtPEM, err := os.ReadFile(c.Certificate)
 		if err != nil {
 			return err
 		}
@@ -143,7 +143,7 @@ func runAction(ctx *cli.Context) error {
 		} else if c.Password != "" {
 			pemOpts = append(pemOpts, pemutil.WithPassword([]byte(c.Password)))
 		}
-		keyBytes, err := ioutil.ReadFile(c.CertificateKey)
+		keyBytes, err := os.ReadFile(c.CertificateKey)
 		if err != nil {
 			return errs.FileError(err, c.CertificateKey)
 		}
@@ -166,7 +166,7 @@ func runAction(ctx *cli.Context) error {
 			MinVersion:   tls.VersionTLS12,
 		}
 		if c.Root != "" {
-			b, err := ioutil.ReadFile(c.Root)
+			b, err := os.ReadFile(c.Root)
 			if err != nil {
 				return errs.FileError(err, c.Root)
 			}
@@ -202,4 +202,15 @@ func runAction(ctx *cli.Context) error {
 	}
 
 	return nil
+}
+
+// readPasswordFromFile reads and returns the password from the given filename.
+// The contents of the file will be trimmed at the right.
+func readPasswordFromFile(filename string) ([]byte, error) {
+	password, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, errs.FileError(err, filename)
+	}
+	password = bytes.TrimRightFunc(password, unicode.IsSpace)
+	return password, nil
 }

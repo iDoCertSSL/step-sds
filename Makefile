@@ -4,12 +4,9 @@ BINNAME?=step-sds
 # Set V to 1 for verbose output from the Makefile
 Q=$(if $V,,@)
 PREFIX?=
-SRC=$(shell find . -type f -name '*.go' -not -path "./vendor/*")
+SRC=$(shell find . -type f -name '*.go')
 GOOS_OVERRIDE ?=
 OUTPUT_ROOT=output/
-
-# Set shell to bash for `echo -e`
-SHELL := /bin/bash
 
 all: build test lint
 
@@ -19,46 +16,54 @@ all: build test lint
 # Bootstrapping
 #########################################
 
-bootstra%:
-	$Q which dep || go get github.com/golang/dep/cmd/dep
-	$Q dep ensure
-	$Q GO111MODULE=on go get github.com/golangci/golangci-lint/cmd/golangci-lint@v1.18.0
+bootstrap:
+	$Q curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin latest
+	$Q go install golang.org/x/vuln/cmd/govulncheck@latest
+	$Q go install gotest.tools/gotestsum@latest
 
-
-vendor: Gopkg.lock
-	$Q dep ensure
-
-define VENDOR_BIN_TMPL
-vendor/bin/$(notdir $(1)): vendor
-	$Q go build -o $$@ ./vendor/$(1)
-VENDOR_BINS += vendor/bin/$(notdir $(1))
-endef
-
-$(foreach pkg,$(BOOTSTRAP),$(eval $(call VENDOR_BIN_TMPL,$(pkg))))
-
-.PHONY: bootstra% vendor
+.PHONY: bootstrap
 
 #################################################
 # Determine the type of `push` and `version`
 #################################################
 
-# Version flags to embed in the binaries
+# If TRAVIS_TAG is set then we know this ref has been tagged.
+ifdef TRAVIS_TAG
+VERSION ?= $(TRAVIS_TAG)
+NOT_RC  := $(shell echo $(VERSION) | grep -v -e -rc)
+	ifeq ($(NOT_RC),)
+PUSHTYPE := release-candidate
+	else
+PUSHTYPE := release
+	endif
+# GITHUB Actions
+else ifdef GITHUB_REF
+VERSION ?= $(shell echo $(GITHUB_REF) | sed 's/^refs\/tags\///')
+NOT_RC  := $(shell echo $(VERSION) | grep -v -e -rc)
+	ifeq ($(NOT_RC),)
+PUSHTYPE := release-candidate
+	else
+PUSHTYPE := release
+	endif
+else
 VERSION ?= $(shell [ -d .git ] && git describe --tags --always --dirty="-dev")
 # If we are not in an active git dir then try reading the version from .VERSION.
 # .VERSION contains a slug populated by `git archive`.
 VERSION := $(or $(VERSION),$(shell ./.version.sh .VERSION))
-VERSION := $(shell echo $(VERSION) | sed 's/^v//')
-NOT_RC  := $(shell echo $(VERSION) | grep -v -e -rc)
-
-# If TRAVIS_TAG is set then we know this ref has been tagged.
-ifdef TRAVIS_TAG
-	ifeq ($(NOT_RC),)
-		PUSHTYPE=release-candidate
+	ifeq ($(TRAVIS_BRANCH),master)
+PUSHTYPE := master
 	else
-		PUSHTYPE=release
+PUSHTYPE := branch
 	endif
-else
-	PUSHTYPE=master
+endif
+
+VERSION := $(shell echo $(VERSION) | sed 's/^v//')
+
+ifdef V
+$(info    TRAVIS_TAG is $(TRAVIS_TAG))
+$(info    GITHUB_REF is $(GITHUB_REF))
+$(info    VERSION is $(VERSION))
+$(info    PUSHTYPE is $(PUSHTYPE))
 endif
 
 #########################################
@@ -69,10 +74,13 @@ DATE    := $(shell date -u '+%Y-%m-%d %H:%M UTC')
 LDFLAGS := -ldflags='-w -X "main.Version=$(VERSION)" -X "main.BuildTime=$(DATE)"'
 GOFLAGS := CGO_ENABLED=0
 
+download:
+	$Q go mod download
+
 build: $(PREFIX)bin/$(BINNAME)
 	@echo "Build Complete!"
 
-$(PREFIX)bin/$(BINNAME): vendor $(call rwildcard,*.go)
+$(PREFIX)bin/$(BINNAME): download $(call rwildcard,*.go)
 	$Q mkdir -p $(@D)
 	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(BINNAME) $(LDFLAGS) $(PKG)
 
@@ -96,19 +104,11 @@ generate:
 #########################################
 # Test
 #########################################
+
 test:
-	$Q $(GOFLAGS) go test -short -coverprofile=coverage.out ./...
+	$Q gotestsum -- -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./...
 
-vtest:
-	$(Q)for d in $$(go list ./... | grep -v vendor); do \
-    echo -e "TESTS FOR: for \033[0;35m$$d\033[0m"; \
-    $(GOFLAGS) go test -v -bench=. -run=. -short -coverprofile=vcoverage.out $$d; \
-	out=$$?; \
-	if [[ $$out -ne 0 ]]; then ret=$$out; fi;\
-    rm -f profile.coverage.out; \
-	done; exit $$ret;
-
-.PHONY: test vtest
+.PHONY: test
 
 integrate: integration
 
@@ -122,11 +122,12 @@ integration: bin/$(BINNAME)
 #########################################
 
 fmt:
-	$Q gofmt -l -w $(SRC)
+	$Q goimports -l -w $(SRC)
 
+lint: SHELL:=/bin/bash
 lint:
-	$Q LOG_LEVEL=error golangci-lint run
-
+	$Q LOG_LEVEL=error golangci-lint run --config <(curl -s https://raw.githubusercontent.com/smallstep/workflows/master/.golangci.yml) --timeout=30m
+	$Q govulncheck ./...
 
 .PHONY: lint fmt
 
@@ -156,76 +157,6 @@ ifneq ($(BINNAME),"")
 endif
 
 .PHONY: clean
-
-#########################################
-# Building Docker Image
-#
-# Builds a dockerfile for step by building a linux version of the step-cli and
-# then copying the specific binary when building the container.
-#
-# This ensures the container is as small as possible without having to deal
-# with getting access to private repositories inside the container during build
-# time.
-#########################################
-
-# XXX We put the output for the build in 'output' so we don't mess with how we
-# do rule overriding from the base Makefile (if you name it 'build' it messes up
-# the wildcarding).
-DOCKER_OUTPUT=$(OUTPUT_ROOT)docker/
-
-DOCKER_MAKE=V=$V GOOS_OVERRIDE='GOOS=linux GOARCH=amd64' PREFIX=$(1) make $(1)bin/$(2)
-DOCKER_BUILD=$Q docker build -t smallstep/$(1):latest -f docker/$(2) --build-arg BINPATH=$(DOCKER_OUTPUT)bin/$(1) .
-
-docker: docker-make docker/Dockerfile.step-sds
-	$(call DOCKER_BUILD,step-sds,Dockerfile.step-sds)
-
-docker-make:
-	mkdir -p $(DOCKER_OUTPUT)
-	$(call DOCKER_MAKE,$(DOCKER_OUTPUT),step-sds)
-
-.PHONY: docker docker-make
-
-#################################################
-# Releasing Docker Images
-#
-# Using the docker build infrastructure, this section is responsible for
-# logging into docker hub and pushing the built docker containers up with the
-# appropriate tags.
-#################################################
-
-DOCKER_TAG=docker tag smallstep/$(1):latest smallstep/$(1):$(2)
-DOCKER_PUSH=docker push smallstep/$(1):$(2)
-
-docker-tag:
-	$(call DOCKER_TAG,step-sds,$(VERSION))
-
-docker-push-tag: docker-tag
-	$(call DOCKER_PUSH,step-sds,$(VERSION))
-
-docker-push-tag-latest:
-	$(call DOCKER_PUSH,step-sds,latest)
-
-# Rely on DOCKER_USERNAME and DOCKER_PASSWORD being set inside the CI or
-# equivalent environment
-docker-login:
-	$Q docker login -u="$(DOCKER_USERNAME)" -p="$(DOCKER_PASSWORD)"
-
-.PHONY: docker-login docker-tag docker-push-tag docker-push-tag-latest
-
-#################################################
-# Targets for pushing the docker images
-#################################################
-
-# For all builds we build the docker container
-docker-master: docker
-
-# For all builds with a release candidate tag
-docker-release-candidate: docker-master docker-login docker-push-tag
-
-# For all builds with a release tag
-docker-release: docker-release-candidate docker-push-tag-latest
-
-.PHONY: docker-master docker-release-candidate docker-release
 
 #########################################
 # Debian
@@ -284,37 +215,3 @@ bundle-darwin: binary-darwin
 	$(call BUNDLE,darwin,$(VERSION),amd64)
 
 .PHONY: binary-linux binary-darwin bundle-linux bundle-darwin
-
-#################################################
-# Targets for creating OS specific artifacts and archives
-#################################################
-
-artifacts-linux-tag: bundle-linux debian
-
-artifacts-darwin-tag: bundle-darwin
-
-artifacts-archive-tag:
-	$Q mkdir -p $(RELEASE)
-	$Q git archive v$(VERSION) | gzip > $(RELEASE)/step-sds.tar.gz
-
-artifacts-tag: artifacts-linux-tag artifacts-darwin-tag artifacts-archive-tag
-
-.PHONY: artifacts-linux-tag artifacts-darwin-tag artifacts-archive-tag artifacts-tag
-
-#################################################
-# Targets for creating step artifacts
-#################################################
-
-# For all builds that are not tagged
-artifacts-master:
-
-# For all build with a release candidate tag
-artifacts-release-candidate: artifacts-tag
-
-# For all builds with a release tag
-artifacts-release: artifacts-tag
-
-# This command is called by travis directly *after* a successful build
-artifacts: artifacts-$(PUSHTYPE) docker-$(PUSHTYPE)
-
-.PHONY: artifacts-master artifacts-release-candidate artifacts-release artifacts

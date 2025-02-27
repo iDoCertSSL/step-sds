@@ -5,22 +5,25 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
-
-	api "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
-	"github.com/gogo/googleapis/google/rpc"
-	"github.com/smallstep/assert"
-	"github.com/smallstep/cli/crypto/x509util"
+	rpc "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
+
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	auth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	secret "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	"github.com/smallstep/assert"
+	"go.step.sm/crypto/x509util"
 )
 
 /*
@@ -45,7 +48,7 @@ func (s *streamServer) Recv() (*v2.DiscoveryRequest, error) {
 		VersionInfo:   "versionInfo",
 		Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 		ResourceNames: []string{"foo.smallstep.com"},
-		TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+		TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 		ResponseNonce: "nonce",
 		ErrorDetail:   nil,
 	}, nil
@@ -126,56 +129,55 @@ func TestService_StreamSecrets(t *testing.T) {
 	srv.Register(s)
 	go func() {
 		if err := s.Serve(lis); err != nil {
-			t.Fatalf("Server exited with error: %v", err)
+			panic(fmt.Sprintf("Server exited with error: %v", err))
 		}
 	}()
 
 	// Prepare client
-	ctx := context.Background()
 	dialer := func(ctx context.Context, s string) (net.Conn, error) {
 		return lis.Dial()
 	}
-	conn, err := grpc.DialContext(ctx, "bufconn", grpc.WithContextDialer(dialer), grpc.WithInsecure())
+	conn, err := grpc.NewClient("localhost", grpc.WithContextDialer(dialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufconn: %v", err)
 	}
 	defer conn.Close()
-	client := discovery.NewSecretDiscoveryServiceClient(conn)
+	client := secret.NewSecretDiscoveryServiceClient(conn)
 
 	tests := []struct {
 		name    string
-		req     *api.DiscoveryRequest
+		req     *discovery.DiscoveryRequest
 		wantErr bool
 	}{
-		{"ok", &api.DiscoveryRequest{
+		{"ok", &discovery.DiscoveryRequest{
 			VersionInfo:   "",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"foo.smallstep.com"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 		}, false},
-		{"ok trusted_ca", &api.DiscoveryRequest{
+		{"ok trusted_ca", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"trusted_ca"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 		}, false},
-		{"ok validation_context", &api.DiscoveryRequest{
+		{"ok validation_context", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"validation_context"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 		}, false},
-		{"ok multiple", &api.DiscoveryRequest{
+		{"ok multiple", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"foo.smallstep.com", "bar.smallstep.com", "trusted_ca", "validation_context"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 		}, false},
-		{"ok with error", &api.DiscoveryRequest{
+		{"ok with error", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"foo.smallstep.com"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 			ErrorDetail:   &rpc.Status{Code: 123, Message: "an error"},
 		}, false},
 	}
@@ -207,19 +209,19 @@ func TestService_StreamSecrets(t *testing.T) {
 				assert.True(t, got.VersionInfo != "")
 				assert.Len(t, len(tt.req.ResourceNames), got.Resources)
 				assert.False(t, got.Canary)
-				assert.Equals(t, "type.googleapis.com/envoy.api.v2.auth.Secret", got.TypeUrl)
+				assert.Equals(t, "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret", got.TypeUrl)
 				assert.Len(t, 64, got.Nonce)
 				assert.Equals(t, &core.ControlPlane{Identifier: Identifier}, got.ControlPlane)
 				for i, r := range got.Resources {
-					assert.Equals(t, "type.googleapis.com/envoy.api.v2.auth.Secret", r.TypeUrl)
-					var secret auth.Secret
-					if assert.NoError(t, secret.Unmarshal(r.Value)) {
-						assert.Equals(t, tt.req.ResourceNames[i], secret.Name)
-						if isValidationContext(secret.Name) {
-							assert.Type(t, &auth.Secret_ValidationContext{}, secret.Type)
+					assert.Equals(t, "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret", r.TypeUrl)
+					var sec auth.Secret
+					if assert.NoError(t, proto.Unmarshal(r.Value, &sec)) {
+						assert.Equals(t, tt.req.ResourceNames[i], sec.Name)
+						if isValidationContext(sec.Name) {
+							assert.Type(t, &auth.Secret_ValidationContext{}, sec.Type)
 						} else {
 							hasServerCert = true
-							assert.Type(t, &auth.Secret_TlsCertificate{}, secret.Type)
+							assert.Type(t, &auth.Secret_TlsCertificate{}, sec.Type)
 						}
 					}
 				}
@@ -254,18 +256,18 @@ func TestService_StreamSecrets(t *testing.T) {
 					assert.True(t, got.VersionInfo != "")
 					assert.Len(t, len(tt.req.ResourceNames), got.Resources)
 					assert.False(t, got.Canary)
-					assert.Equals(t, "type.googleapis.com/envoy.api.v2.auth.Secret", got.TypeUrl)
+					assert.Equals(t, "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret", got.TypeUrl)
 					assert.Len(t, 64, got.Nonce)
 					assert.Equals(t, &core.ControlPlane{Identifier: Identifier}, got.ControlPlane)
 					for i, r := range got.Resources {
-						assert.Equals(t, "type.googleapis.com/envoy.api.v2.auth.Secret", r.TypeUrl)
-						var secret auth.Secret
-						if assert.NoError(t, secret.Unmarshal(r.Value)) {
-							assert.Equals(t, tt.req.ResourceNames[i], secret.Name)
-							if isValidationContext(secret.Name) {
-								assert.Type(t, &auth.Secret_ValidationContext{}, secret.Type)
+						assert.Equals(t, "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret", r.TypeUrl)
+						var sec auth.Secret
+						if assert.NoError(t, proto.Unmarshal(r.Value, &sec)) {
+							assert.Equals(t, tt.req.ResourceNames[i], sec.Name)
+							if isValidationContext(sec.Name) {
+								assert.Type(t, &auth.Secret_ValidationContext{}, sec.Type)
 							} else {
-								assert.Type(t, &auth.Secret_TlsCertificate{}, secret.Type)
+								assert.Type(t, &auth.Secret_TlsCertificate{}, sec.Type)
 							}
 						}
 					}
@@ -298,53 +300,52 @@ func TestService_FetchSecrets(t *testing.T) {
 	srv.Register(s)
 	go func() {
 		if err := s.Serve(lis); err != nil {
-			t.Fatalf("Server exited with error: %v", err)
+			panic(fmt.Sprintf("Server exited with error: %v", err))
 		}
 	}()
 
 	// Prepare client
-	ctx := context.Background()
 	dialer := func(ctx context.Context, s string) (net.Conn, error) {
 		return lis.Dial()
 	}
-	conn, err := grpc.DialContext(ctx, "bufconn", grpc.WithContextDialer(dialer), grpc.WithInsecure())
+	conn, err := grpc.NewClient("localhost", grpc.WithContextDialer(dialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufconn: %v", err)
 	}
 	defer conn.Close()
-	client := discovery.NewSecretDiscoveryServiceClient(conn)
+	client := secret.NewSecretDiscoveryServiceClient(conn)
 
 	tests := []struct {
 		name    string
-		req     *api.DiscoveryRequest
+		req     *discovery.DiscoveryRequest
 		wantErr bool
 	}{
-		{"ok", &api.DiscoveryRequest{
+		{"ok", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"foo.smallstep.com"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 			ResponseNonce: "response-nonce",
 		}, false},
-		{"ok trusted_ca", &api.DiscoveryRequest{
+		{"ok trusted_ca", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"trusted_ca"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 			ResponseNonce: "response-nonce",
 		}, false},
-		{"ok validation_context", &api.DiscoveryRequest{
+		{"ok validation_context", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"validation_context"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 			ResponseNonce: "response-nonce",
 		}, false},
-		{"ok multiple", &api.DiscoveryRequest{
+		{"ok multiple", &discovery.DiscoveryRequest{
 			VersionInfo:   "versionInfo",
 			Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 			ResourceNames: []string{"foo.smallstep.com", "bar.smallstep.com", "trusted_ca", "validation_context"},
-			TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+			TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 			ResponseNonce: "response-nonce",
 		}, false},
 	}
@@ -360,18 +361,18 @@ func TestService_FetchSecrets(t *testing.T) {
 				assert.True(t, got.VersionInfo != "")
 				assert.Len(t, len(tt.req.ResourceNames), got.Resources)
 				assert.False(t, got.Canary)
-				assert.Equals(t, "type.googleapis.com/envoy.api.v2.auth.Secret", got.TypeUrl)
+				assert.Equals(t, "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret", got.TypeUrl)
 				assert.Len(t, 64, got.Nonce)
 				assert.Equals(t, &core.ControlPlane{Identifier: Identifier}, got.ControlPlane)
 				for i, r := range got.Resources {
-					assert.Equals(t, "type.googleapis.com/envoy.api.v2.auth.Secret", r.TypeUrl)
-					var secret auth.Secret
-					if assert.NoError(t, secret.Unmarshal(r.Value)) {
-						assert.Equals(t, tt.req.ResourceNames[i], secret.Name)
-						if isValidationContext(secret.Name) {
-							assert.Type(t, &auth.Secret_ValidationContext{}, secret.Type)
+					assert.Equals(t, "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret", r.TypeUrl)
+					var sec auth.Secret
+					if assert.NoError(t, proto.Unmarshal(r.Value, &sec)) {
+						assert.Equals(t, tt.req.ResourceNames[i], sec.Name)
+						if isValidationContext(sec.Name) {
+							assert.Type(t, &auth.Secret_ValidationContext{}, sec.Type)
 						} else {
-							assert.Type(t, &auth.Secret_TlsCertificate{}, secret.Type)
+							assert.Type(t, &auth.Secret_TlsCertificate{}, sec.Type)
 						}
 					}
 				}
@@ -381,11 +382,11 @@ func TestService_FetchSecrets(t *testing.T) {
 }
 
 func TestService_validateRequest(t *testing.T) {
-	req := &api.DiscoveryRequest{
+	req := &discovery.DiscoveryRequest{
 		VersionInfo:   "versionInfo",
 		Node:          &core.Node{Id: "node-id", Cluster: "node-cluster"},
 		ResourceNames: []string{"foo.smallstep.com"},
-		TypeUrl:       "type.googleapis.com/envoy.api.v2.auth.Secret",
+		TypeUrl:       "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
 		ResponseNonce: "response-nonce",
 	}
 
@@ -424,7 +425,7 @@ func TestService_validateRequest(t *testing.T) {
 	}
 	type args struct {
 		ctx context.Context
-		r   *api.DiscoveryRequest
+		r   *discovery.DiscoveryRequest
 	}
 	tests := []struct {
 		name    string

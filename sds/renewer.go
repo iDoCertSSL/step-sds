@@ -12,7 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/ca"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
 	"golang.org/x/net/http2"
 )
 
@@ -173,7 +173,6 @@ func (s *secretRenewer) createCertAndTransport(sign *api.SignResponse, pk crypto
 
 	tlsConfig := getDefaultTLSConfig(sign)
 	tlsConfig.Certificates = []tls.Certificate{*cert}
-	tlsConfig.PreferServerCipherSuites = true
 	if len(s.roots) > 0 {
 		pool := x509.NewCertPool()
 		for _, cert := range s.roots {
